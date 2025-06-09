@@ -1,9 +1,3 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# In[2]:
-
-
 import os
 import zipfile
 import shutil
@@ -69,17 +63,20 @@ def main():
     # Connect to LanceDB
     db = lancedb.connect(LANCE_DB_PATH)
     schema = pa.schema([
-        ("story_id", pa.string()),
-        ("vector", pa.list_(pa.float32())),
-        ("file_name", pa.string()),
-        ("test_case_generated", pa.string()),
-        ("timestamp", pa.string()),
+    ("story_id", pa.string()),
+    ("story desc vector", pa.list_(pa.float32())),
+    ("file_name", pa.string()),
+    ("processed_flags", pa.string()),
+    ("timestamp", pa.string()),
+    ("test_cases", pa.list_(pa.float32())),  # ✅ Vector for LLM-generated test cases
     ])
+
     # Open or create table
-    if "test_cases" in db.table_names():
-        table = db.open_table("test_cases")
+    
+    if "user_stories" in db.table_names():
+        table = db.open_table("user_stories")
     else:
-        table = db.create_table("test_cases", schema=schema)
+        table = db.create_table("user_stories", schema=schema)
 
     all_rows = []
 
@@ -91,7 +88,7 @@ def main():
 
         file_type = get_file_type(file_path)
         if file_type == "unknown":
-            print(f"⏭️ Skipping unsupported file: {file_name}")
+            print(f"⏭ Skipping unsupported file: {file_name}")
             shutil.move(file_path, os.path.join(FAILURE_FOLDER, file_name))
             continue
 
@@ -121,12 +118,17 @@ def main():
 
             # Step 4: Store
             all_rows.append({
-                "story_id": story_id,
-                "vector": vector,
-                "file_name": file_name,
-                "test_case_generated": "NO",
-                "timestamp": timestamp
+                all_rows.append({
+    "story_id": story_id,
+    "story_desc_vector": vector,           
+    "file_name": file_name,
+    "processed_flags": "NO",             
+    "timestamp": timestamp,
+    "test_cases": []                     
+})
+
             })
+
 
             # Step 5: Move to success
             shutil.move(file_path, os.path.join(SUCCESS_FOLDER, file_name))
@@ -140,31 +142,7 @@ def main():
         table.add(all_rows)
         print(f"\n✅ {len(all_rows)} files inserted into LanceDB.")
     else:
-        print("⚠️ No new files inserted.")
+        print("⚠ No new files inserted.")
 
-if __name__ == "__main__":
+if __name__== "__main__":
     main()
-
-
-# In[3]:
-
-
-import lancedb
-
-# Connect to the LanceDB folder
-db = lancedb.connect("UserStories/my_lance_db")
-
-# Open the existing table
-table = db.open_table("test_cases")
-
-# Convert to DataFrame and print
-df = table.to_pandas()
-print("📄 Contents of 'test_cases' table:")
-print(df)
-
-
-# In[ ]:
-
-
-
-
