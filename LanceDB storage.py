@@ -1,5 +1,4 @@
 import os
-import zipfile
 import shutil
 import fitz  # PyMuPDF
 from docx import Document
@@ -33,8 +32,6 @@ def extract_text_from_pdf(file_path: str) -> str:
     return "".join(page.get_text() for page in doc)
 
 def extract_text_from_docx(file_path: str) -> str:
-    if not zipfile.is_zipfile(file_path):
-        raise ValueError(f"'{file_path}' is not a valid DOCX file.")
     doc = Document(file_path)
     return "\n".join(para.text for para in doc.paragraphs)
 
@@ -63,16 +60,15 @@ def main():
     # Connect to LanceDB
     db = lancedb.connect(LANCE_DB_PATH)
     schema = pa.schema([
-    ("story_id", pa.string()),
-    ("story desc vector", pa.list_(pa.float32())),
-    ("file_name", pa.string()),
-    ("processed_flags", pa.string()),
-    ("timestamp", pa.string()),
-    ("test_cases", pa.list_(pa.float32())),  # ✅ Vector for LLM-generated test cases
+        ("story_id", pa.string()),
+        ("story desc", pa.string()),
+        ("story desc vector", pa.list_(pa.float32())),
+        ("processed_flags", pa.string()),
+        ("timestamp", pa.string()),
+        ("test_cases", pa.list_(pa.float32())),
     ])
 
     # Open or create table
-    
     if "user_stories" in db.table_names():
         table = db.open_table("user_stories")
     else:
@@ -118,17 +114,13 @@ def main():
 
             # Step 4: Store
             all_rows.append({
-                all_rows.append({
-    "story_id": story_id,
-    "story_desc_vector": vector,           
-    "file_name": file_name,
-    "processed_flags": "NO",             
-    "timestamp": timestamp,
-    "test_cases": []                     
-})
-
+                "story_id": story_id,
+                "story desc": file_name,
+                "story desc vector": vector,
+                "processed_flags": "NO",
+                "timestamp": timestamp,
+                "test_cases": []
             })
-
 
             # Step 5: Move to success
             shutil.move(file_path, os.path.join(SUCCESS_FOLDER, file_name))
@@ -144,5 +136,5 @@ def main():
     else:
         print("⚠ No new files inserted.")
 
-if __name__== "__main__":
+if __name__ == "__main__":
     main()
