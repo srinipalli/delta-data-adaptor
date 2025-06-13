@@ -1,169 +1,146 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# In[2]:
-
-
 import os
-import zipfile
 import shutil
-import fitz  # PyMuPDF
+import json
+import lancedb
+import fitz
+import pyarrow as pa
 from docx import Document
 from datetime import datetime
-from typing import List
-import lancedb
-import pyarrow as pa
-import numpy as np
-import pytz
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from sentence_transformers import SentenceTransformer
+from langchain_google_genai import ChatGoogleGenerativeAI
+from dotenv import load_dotenv
 
-# Set Gemini API Key
-os.environ["GOOGLE_API_KEY"] = "AIzaSyAUhKKil9ZSreVmNzF-_aOb2K-e03AzoY0"
+load_dotenv()
 
-# Folder Setup
-BASE_FOLDER = "UserStories"
-UPLOAD_FOLDER = os.path.join(BASE_FOLDER, "uploaded_docs")
-SUCCESS_FOLDER = os.path.join(BASE_FOLDER, "success")
-FAILURE_FOLDER = os.path.join(BASE_FOLDER, "failure")
-LANCE_DB_PATH = os.path.join(BASE_FOLDER, "my_lance_db")
+# Load config
+with open("config.json", "r") as f:
+    config = json.load(f)
 
-# Create folders if not exist
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+UPLOAD_FOLDER = config.get("uploaded_docs", "uploaded_docs")
+SUCCESS_FOLDER = "success"
+FAILURE_FOLDER = "failure"
+LANCE_DB_PATH = "my_lance_db"
+TABLE_NAME = "user_stories"
+
 os.makedirs(SUCCESS_FOLDER, exist_ok=True)
 os.makedirs(FAILURE_FOLDER, exist_ok=True)
-os.makedirs(LANCE_DB_PATH, exist_ok=True)
 
-# ----- Text Extraction Functions -----
-def extract_text_from_pdf(file_path: str) -> str:
-    doc = fitz.open(file_path)
-    return "".join(page.get_text() for page in doc)
+embedding_model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
+db = lancedb.connect(LANCE_DB_PATH)
 
-def extract_text_from_docx(file_path: str) -> str:
-    if not zipfile.is_zipfile(file_path):
-        raise ValueError(f"'{file_path}' is not a valid DOCX file.")
-    doc = Document(file_path)
-    return "\n".join(para.text for para in doc.paragraphs)
+# Create table if needed
+schema = pa.schema([
+    ("vector", pa.list_(pa.float32(), 768)),
+    ("storyID", pa.string()),
+    ("storyDescription", pa.string()),
+    ("test_case_content", pa.string()),
+    ("filename", pa.string()),
+    ("original_path", pa.string()),
+    ("doc_content_text", pa.string())
+])
 
-def extract_text_from_txt(file_path: str) -> str:
-    with open(file_path, "r", encoding="utf-8") as f:
-        return f.read()
+table = db.create_table(TABLE_NAME, schema=schema, exist_ok=True)
+print(f"Table '{TABLE_NAME}' is ready.")
 
-def embed_text(text: str, model: GoogleGenerativeAIEmbeddings) -> List[float]:
-    return model.embed_query(text)
+# Initialize LLM
+llm = ChatGoogleGenerativeAI(
+    model="models/gemini-2.0-flash",
+    temperature=0.3,
+    google_api_key=os.environ["GOOGLE_API_KEY"]
+)
 
-def get_file_type(file_path: str) -> str:
-    ext = os.path.splitext(file_path)[1].lower()
-    return {"pdf": "pdf", "docx": "docx", "txt": "txt"}.get(ext[1:], "unknown")
+def extract_text(file_path):
+    try:
+        if file_path.endswith(".pdf"):
+            with fitz.open(file_path) as doc:
+                return "\n".join(page.get_text() for page in doc)
+        elif file_path.endswith(".docx"):
+            doc = Document(file_path)
+            return "\n".join(p.text for p in doc.paragraphs)
+        elif file_path.endswith(".txt"):
+            with open(file_path, "r", encoding="utf-8") as f:
+                return f.read()
+        else:
+            return None
+    except Exception as e:
+        print(f"❌ Error reading {file_path}: {e}")
+        return None
 
-def generate_story_id(file_name: str) -> str:
-    return f"{os.path.splitext(file_name)[0]}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+def summarize_in_chunks(text, chunk_size=4000):
+    try:
+        chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+        summaries = []
+        for chunk in chunks[:3]:  # Limit to 3 chunks for efficiency
+            prompt = (
+                "Summarize the following document section in 1 sentence:\n\n" + chunk
+            )
+            try:
+                response = llm.invoke(prompt)
+                summaries.append(response.content.strip())
+            except Exception as e:
+                summaries.append("[Summary failed for a chunk]")
+                print(f"❌ LLM failed on a chunk: {e}")
+        return " ".join(summaries)
+    except Exception as e:
+        print(f"❌ LLM summary failed: {e}")
+        return "Summary could not be generated."
 
-def get_current_ist_timestamp() -> str:
-    return datetime.now(pytz.timezone("Asia/Kolkata")).isoformat()
+def story_id_exists(table, story_id):
+    try:
+        result = table.to_pandas().query("storyID == @story_id")
+        return not result.empty
+    except Exception:
+        return False
 
-# ----- Main Processing Function -----
-def main():
-    # Load Gemini embedding model
-    model = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+for file in os.listdir(UPLOAD_FOLDER):
+    file_path = os.path.join(UPLOAD_FOLDER, file)
 
-    # Connect to LanceDB
-    db = lancedb.connect(LANCE_DB_PATH)
-    schema = pa.schema([
-        ("story_id", pa.string()),
-        ("vector", pa.list_(pa.float32())),
-        ("file_name", pa.string()),
-        ("test_case_generated", pa.string()),
-        ("timestamp", pa.string()),
-    ])
-    # Open or create table
-    if "test_cases" in db.table_names():
-        table = db.open_table("test_cases")
-    else:
-        table = db.create_table("test_cases", schema=schema)
+    if os.path.isdir(file_path):
+        continue
 
-    all_rows = []
+    print(f"📄 Processing {file}...")
 
-    # Process each file
-    for file_name in os.listdir(UPLOAD_FOLDER):
-        file_path = os.path.join(UPLOAD_FOLDER, file_name)
-        if not os.path.isfile(file_path):
+    text = extract_text(file_path)
+
+    if not text:
+        print(f"❌ Skipping {file} — couldn't extract text.")
+        shutil.move(file_path, os.path.join(FAILURE_FOLDER, file))
+        continue
+
+    try:
+        story_id = os.path.splitext(file)[0]
+
+        if story_id_exists(table, story_id):
+            print(f"⚠ Skipping {file} — storyID '{story_id}' already exists.")
+            shutil.move(file_path, os.path.join(FAILURE_FOLDER, file))
             continue
 
-        file_type = get_file_type(file_path)
-        if file_type == "unknown":
-            print(f"⏭️ Skipping unsupported file: {file_name}")
-            shutil.move(file_path, os.path.join(FAILURE_FOLDER, file_name))
-            continue
+        story_description = summarize_in_chunks(text)
 
         try:
-            # Step 1: Extract text
-            if file_type == "pdf":
-                text = extract_text_from_pdf(file_path)
-            elif file_type == "docx":
-                text = extract_text_from_docx(file_path)
-            elif file_type == "txt":
-                text = extract_text_from_txt(file_path)
-            else:
-                raise ValueError("Unsupported file type")
-
-            if not text.strip():
-                raise ValueError("Empty text extracted")
-
-            # Step 2: Embed
-            vector = embed_text(text, model)
-            story_id = generate_story_id(file_name)
-            timestamp = get_current_ist_timestamp()
-
-            # Step 3: Show content
-            print(f"\n📄 File: {file_name}")
-            print(f"🆔 Story ID: {story_id}")
-            print(f"📌 Text Preview:\n{text[:300]}...")
-
-            # Step 4: Store
-            all_rows.append({
-                "story_id": story_id,
-                "vector": vector,
-                "file_name": file_name,
-                "test_case_generated": "NO",
-                "timestamp": timestamp
-            })
-
-            # Step 5: Move to success
-            shutil.move(file_path, os.path.join(SUCCESS_FOLDER, file_name))
-
+            embedding = embedding_model.encode(text).tolist()
         except Exception as e:
-            print(f"❌ Failed to process {file_name}: {e}")
-            shutil.move(file_path, os.path.join(FAILURE_FOLDER, file_name))
+            print(f"❌ Embedding generation failed for {file}: {e}")
+            shutil.move(file_path, os.path.join(FAILURE_FOLDER, file))
+            continue
 
-    # Insert rows
-    if all_rows:
-        table.add(all_rows)
-        print(f"\n✅ {len(all_rows)} files inserted into LanceDB.")
-    else:
-        print("⚠️ No new files inserted.")
+        print(f"🔢 Vector length: {len(embedding)} for {file}")
 
-if __name__ == "__main__":
-    main()
+        table.add([{
+            "vector": embedding,
+            "storyID": story_id,
+            "storyDescription": story_description,
+            "test_case_content": "",
+            "filename": file,
+            "original_path": file_path,
+            "doc_content_text": text
+        }])
 
-
-# In[3]:
-
-
-import lancedb
-
-# Connect to the LanceDB folder
-db = lancedb.connect("UserStories/my_lance_db")
-
-# Open the existing table
-table = db.open_table("test_cases")
-
-# Convert to DataFrame and print
-df = table.to_pandas()
-print("📄 Contents of 'test_cases' table:")
-print(df)
-
-
-# In[ ]:
+        shutil.move(file_path, os.path.join(SUCCESS_FOLDER, file))
+        print(f"✅ Stored {file} in LanceDB and moved to success.")
+    except Exception as e:
+        print(f"❌ Error storing {file}: {e}")
+        shutil.move(file_path, os.path.join(FAILURE_FOLDER, file))
 
 
 
